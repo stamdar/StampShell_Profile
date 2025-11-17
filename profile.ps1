@@ -149,29 +149,96 @@ function Add-Path {
     $env:Path    = "$machinePath;$userPath"
 }
 
+function Get-OrCreate-StampShellCodeSigningCert {
+    [CmdletBinding()]
+    param(
+        [string]$Subject = "CN=StampShell Code Signing"
+    )
+
+    # Try to find an existing code-signing cert for this subject
+    $existing = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert -ErrorAction SilentlyContinue |
+                Where-Object { $_.Subject -eq $Subject } |
+                Sort-Object NotAfter -Descending |
+                Select-Object -First 1
+
+    if ($existing) {
+        Write-Host "[=] Using existing StampShell code-signing cert: $($existing.Thumbprint)" -ForegroundColor DarkGray
+        return $existing
+    }
+
+    Write-Host "[*] Creating new StampShell code-signing certificate..." -ForegroundColor Yellow
+
+    $cert = New-SelfSignedCertificate `
+        -Type CodeSigningCert `
+        -Subject $Subject `
+        -KeyExportPolicy Exportable `
+        -KeyUsage DigitalSignature `
+        -KeyAlgorithm RSA `
+        -KeyLength 4096 `
+        -CertStoreLocation "Cert:\CurrentUser\My"
+
+    Write-Host "[+] Created StampShell code-signing cert: $($cert.Thumbprint)" -ForegroundColor Green
+    return $cert
+}
+
+function Ensure-StampShellCertTrusted {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate
+    )
+
+    $stores = @(
+        @{ Name = "TrustedPublisher"; Location = "CurrentUser" },
+        @{ Name = "Root";             Location = "CurrentUser" }
+    )
+
+    foreach ($s in $stores) {
+        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($s.Name, $s.Location)
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+
+        $existing = $store.Certificates |
+                    Where-Object { $_.Thumbprint -eq $Certificate.Thumbprint }
+
+        if (-not $existing) {
+            $store.Add($Certificate)
+            Write-Host "[+] Added StampShell code-signing cert to $($s.Location)\$($s.Name)." -ForegroundColor Green
+        } else {
+            Write-Host "[=] StampShell cert already in $($s.Location)\$($s.Name)." -ForegroundColor DarkGray
+        }
+
+        $store.Close()
+    }
+}
+
 function sign {
     param(
         [Parameter(Mandatory)][string]$FilePath
     )
+
     $resolved = Resolve-Path -LiteralPath $FilePath -ErrorAction SilentlyContinue
     if (-not $resolved) {
         Write-Error "File not found: $FilePath"
         return
     }
 
-    $CertSubject = "CN=Script Signing - $env:USERNAME"
-    $Certificate = Get-ChildItem -Path Cert:\CurrentUser\My -CodeSigningCert |
-                   Where-Object { $_.Subject -eq $CertSubject } |
-                   Select-Object -First 1
-
-    if (-not $Certificate) {
-        Write-Error "Script signing certificate not found for subject: $CertSubject"
+    # Always prefer the StampShell Code Signing cert; create & trust if missing
+    try {
+        $cert = Get-OrCreate-StampShellCodeSigningCert
+        Ensure-StampShellCertTrusted -Certificate $cert
+    } catch {
+        Write-Error "Failed to obtain or trust StampShell code-signing certificate: $($_.Exception.Message)"
         return
     }
 
     try {
-        Set-AuthenticodeSignature -FilePath $resolved.Path -Certificate $Certificate | Out-Null
-        Write-Host "[+] Signed $($resolved.Path) with certificate subject $CertSubject" -ForegroundColor Green
+        $sig = Set-AuthenticodeSignature -FilePath $resolved.Path -Certificate $cert -ErrorAction Stop
+
+        if ($sig.Status -eq 'Valid') {
+            Write-Host "[+] Signed $($resolved.Path) with StampShell code-signing cert ($($cert.Thumbprint))" -ForegroundColor Green
+        } else {
+            Write-Warning "Signature on $($resolved.Path) has status '$($sig.Status)'."
+        }
     } catch {
         Write-Error "Failed to sign file: $($_.Exception.Message)"
     }
