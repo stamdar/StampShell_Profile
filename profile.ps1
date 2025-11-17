@@ -211,6 +211,38 @@ function Ensure-StampShellCertTrusted {
     }
 }
 
+# ----------------------------------------
+#  Ensure execution policy is AllSigned for this user
+#  (when box default is Restricted & no GPO is enforcing)
+# ----------------------------------------
+try {
+    $epList = Get-ExecutionPolicy -List  # see all scopes
+
+    $machinePolicy = ($epList | Where-Object { $_.Scope -eq 'MachinePolicy' }).ExecutionPolicy
+    $userPolicy    = ($epList | Where-Object { $_.Scope -eq 'UserPolicy' }).ExecutionPolicy
+    $localMachine  = ($epList | Where-Object { $_.Scope -eq 'LocalMachine' }).ExecutionPolicy
+    $currentUser   = ($epList | Where-Object { $_.Scope -eq 'CurrentUser' }).ExecutionPolicy
+
+    $gpoEnforced = ($machinePolicy -ne 'Undefined' -or $userPolicy -ne 'Undefined')
+
+    if ($gpoEnforced) {
+        Write-Host "[=] Execution policy is controlled by Group Policy; not modifying." -ForegroundColor DarkGray
+    }
+    else {
+        # Typical standalone box: LocalMachine = Restricted, CurrentUser = Undefined
+        if ($localMachine -eq 'Restricted' -and $currentUser -ne 'AllSigned') {
+            Write-Host "[*] Setting CurrentUser execution policy to AllSigned (LocalMachine is Restricted)." -ForegroundColor Yellow
+            Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy AllSigned -Force
+        }
+        else {
+            Write-Host "[=] Execution policy already suitable (LocalMachine=$localMachine, CurrentUser=$currentUser)." -ForegroundColor DarkGray
+        }
+    }
+}
+catch {
+    Write-Warning "Failed to inspect or set execution policy: $($_.Exception.Message)"
+}
+
 function sign {
     param(
         [Parameter(Mandatory)][string]$FilePath
