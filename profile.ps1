@@ -237,11 +237,11 @@ function Clear-And-Banner {
     $ipText = if ($ip) { $ip } else { "(none)" }
     $ipStr = "IPv4 addr: " + $ipText
 
-    $pubStr = "Public IP: (unavailable)"
+    $pubStr = "Public IP: (unavailable)\n"
     try {
         $resp = Invoke-WebRequest "https://ifconfig.me/ip" -UseBasicParsing -TimeoutSec 3
         if ($resp -and $resp.Content) {
-            $pubStr = "Public IP: " + $resp.Content.Trim()
+            $pubStr = "Public IP: " + $resp.Content.Trim() + "\n"
         }
     } catch { }
 
