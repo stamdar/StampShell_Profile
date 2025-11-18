@@ -17,7 +17,7 @@ function Get-OrCreate-StampShellCodeSigningCert {
                 Select-Object -First 1
 
     if ($existing) {
-        Write-Host "[=] Using existing StampShell code-signing cert: $($existing.Thumbprint)" -ForegroundColor DarkGray
+        Write-Host "\n[=] Using existing StampShell code-signing cert: $($existing.Thumbprint)" -ForegroundColor DarkGray
         return $existing
     }
 
@@ -241,7 +241,7 @@ function Clear-And-Banner {
     try {
         $resp = Invoke-WebRequest "https://ifconfig.me/ip" -UseBasicParsing -TimeoutSec 3
         if ($resp -and $resp.Content) {
-            $pubStr = "Public IP: " + $resp.Content.Trim() + "\n"
+            $pubStr = "Public IP: " + $resp.Content.Trim()
         }
     } catch { }
 
