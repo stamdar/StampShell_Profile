@@ -241,7 +241,7 @@ function Clear-And-Banner {
     try {
         $resp = Invoke-WebRequest "https://ifconfig.me/ip" -UseBasicParsing -TimeoutSec 3
         if ($resp -and $resp.Content) {
-            $pubStr = "Public IP: " + $resp.Content.Trim()
+            $pubStr = "Public IP: " + $resp.Content.Trim() + "\n"
         }
     } catch { }
 
