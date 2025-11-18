@@ -2,6 +2,149 @@
 #  Custom StampShell Profile
 # ================================
 
+
+# --- Setup code signing, sign profile and imported modules ---
+function Get-OrCreate-StampShellCodeSigningCert {
+    [CmdletBinding()]
+    param(
+        [string]$Subject = "CN=StampShell Code Signing"
+    )
+
+    # Try to find an existing code-signing cert for this subject
+    $existing = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert -ErrorAction SilentlyContinue |
+                Where-Object { $_.Subject -eq $Subject } |
+                Sort-Object NotAfter -Descending |
+                Select-Object -First 1
+
+    if ($existing) {
+        Write-Host "[=] Using existing StampShell code-signing cert: $($existing.Thumbprint)" -ForegroundColor DarkGray
+        return $existing
+    }
+
+    Write-Host "[*] Creating new StampShell code-signing certificate..." -ForegroundColor Yellow
+
+    $cert = New-SelfSignedCertificate `
+        -Type CodeSigningCert `
+        -Subject $Subject `
+        -KeyExportPolicy Exportable `
+        -KeyUsage DigitalSignature `
+        -KeyAlgorithm RSA `
+        -KeyLength 4096 `
+        -CertStoreLocation "Cert:\CurrentUser\My"
+
+    Write-Host "[+] Created StampShell code-signing cert: $($cert.Thumbprint)" -ForegroundColor Green
+    return $cert
+}
+
+function Ensure-StampShellCertTrusted {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate
+    )
+
+    $stores = @(
+        @{ Name = "TrustedPublisher"; Location = "CurrentUser" },
+        @{ Name = "Root";             Location = "CurrentUser" }
+    )
+
+    foreach ($s in $stores) {
+        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($s.Name, $s.Location)
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+
+        $existing = $store.Certificates |
+                    Where-Object { $_.Thumbprint -eq $Certificate.Thumbprint }
+
+        if (-not $existing) {
+            $store.Add($Certificate)
+            Write-Host "[+] Added StampShell code-signing cert to $($s.Location)\$($s.Name)." -ForegroundColor Green
+        } else {
+            Write-Host "[=] StampShell cert already in $($s.Location)\$($s.Name)." -ForegroundColor DarkGray
+        }
+
+        $store.Close()
+    }
+}
+
+# ----------------------------------------
+#  Ensure execution policy is AllSigned for this user
+#  (when box default is Restricted & no GPO is enforcing)
+# ----------------------------------------
+try {
+    $epList = Get-ExecutionPolicy -List  # see all scopes
+
+    $machinePolicy = ($epList | Where-Object { $_.Scope -eq 'MachinePolicy' }).ExecutionPolicy
+    $userPolicy    = ($epList | Where-Object { $_.Scope -eq 'UserPolicy' }).ExecutionPolicy
+    $localMachine  = ($epList | Where-Object { $_.Scope -eq 'LocalMachine' }).ExecutionPolicy
+    $currentUser   = ($epList | Where-Object { $_.Scope -eq 'CurrentUser' }).ExecutionPolicy
+
+    $gpoEnforced = ($machinePolicy -ne 'Undefined' -or $userPolicy -ne 'Undefined')
+
+    if ($gpoEnforced) {
+        Write-Host "[=] Execution policy is controlled by Group Policy; not modifying." -ForegroundColor DarkGray
+    }
+    else {
+        # Typical standalone box: LocalMachine = Restricted, CurrentUser = Undefined
+        if ($localMachine -eq 'Restricted' -and $currentUser -ne 'AllSigned') {
+            Write-Host "[*] Setting CurrentUser execution policy to AllSigned (LocalMachine is Restricted)." -ForegroundColor Yellow
+            Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy AllSigned -Force
+        }
+        else {
+            Write-Host "[=] Execution policy already suitable (LocalMachine=$localMachine, CurrentUser=$currentUser)." -ForegroundColor DarkGray
+        }
+    }
+}
+catch {
+    Write-Warning "Failed to inspect or set execution policy: $($_.Exception.Message)"
+}
+
+function Protect-ModuleScripts {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$ModuleNames
+    )
+
+    $cert = Get-OrCreate-StampShellCodeSigningCert
+    Ensure-StampShellCertTrusted -Certificate $cert
+
+    foreach ($name in $ModuleNames) {
+        try {
+            $mod = Get-Module -ListAvailable -Name $name | Select-Object -First 1
+            if (-not $mod) {
+                Write-Host "[=] Module '$name' not found; skipping signing." -ForegroundColor DarkGray
+                continue
+            }
+
+            $root = $mod.ModuleBase
+            Write-Host "[*] Ensuring scripts for module '$name' are signed in '$root'..." -ForegroundColor Cyan
+
+            $files = Get-ChildItem -Path $root -Recurse -Include *.ps1,*.psm1,*.psd1 -ErrorAction SilentlyContinue
+
+            foreach ($f in $files) {
+                try {
+                    $sig = Get-AuthenticodeSignature -FilePath $f.FullName -ErrorAction SilentlyContinue
+
+                    # Skip if already validly signed
+                    if ($sig -and $sig.Status -eq 'Valid') {
+                        continue
+                    }
+
+                    $sig2 = Set-AuthenticodeSignature -FilePath $f.FullName -Certificate $cert -ErrorAction Stop
+                    if ($sig2.Status -eq 'Valid') {
+                        Write-Host "[+] Signed $($f.FullName) for module '$name'." -ForegroundColor DarkGreen
+                    } else {
+                        Write-Warning "Signature status for $($f.FullName) is '$($sig2.Status)'."
+                    }
+                } catch {
+                    Write-Warning "Failed to sign $($f.FullName): $($_.Exception.Message)"
+                }
+            }
+        } catch {
+            Write-Warning "Failed to process module '$name': $($_.Exception.Message)"
+        }
+    }
+}
+
 # Ensure modules we import are signed for AllSigned policy
 Protect-ModuleScripts -ModuleNames @(
     'Terminal-Icons',
@@ -27,17 +170,6 @@ if (Get-Command grep.exe -ErrorAction SilentlyContinue) {
     if (Get-Item Alias:grep -ErrorAction SilentlyContinue) {
         Remove-Item Alias:grep -ErrorAction SilentlyContinue
     }
-}
-
-# Aliases
-Set-Alias -Name ifconfig -Value ipconfig -ErrorAction SilentlyContinue
-Set-Alias -Name ll       -Value ls       -ErrorAction SilentlyContinue
-Set-Alias -Name reboot   -Value Restart-Computer -ErrorAction SilentlyContinue
-Set-Alias -Name c        -Value Clear-And-Banner -ErrorAction SilentlyContinue
-Set-Alias -Name shell    -Value PowerShell -ErrorAction SilentlyContinue
-
-function cd.. {
-    Set-Location "..\.."
 }
 
 function explore {
@@ -157,147 +289,6 @@ function Add-Path {
     $env:Path    = "$machinePath;$userPath"
 }
 
-function Get-OrCreate-StampShellCodeSigningCert {
-    [CmdletBinding()]
-    param(
-        [string]$Subject = "CN=StampShell Code Signing"
-    )
-
-    # Try to find an existing code-signing cert for this subject
-    $existing = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert -ErrorAction SilentlyContinue |
-                Where-Object { $_.Subject -eq $Subject } |
-                Sort-Object NotAfter -Descending |
-                Select-Object -First 1
-
-    if ($existing) {
-        Write-Host "[=] Using existing StampShell code-signing cert: $($existing.Thumbprint)" -ForegroundColor DarkGray
-        return $existing
-    }
-
-    Write-Host "[*] Creating new StampShell code-signing certificate..." -ForegroundColor Yellow
-
-    $cert = New-SelfSignedCertificate `
-        -Type CodeSigningCert `
-        -Subject $Subject `
-        -KeyExportPolicy Exportable `
-        -KeyUsage DigitalSignature `
-        -KeyAlgorithm RSA `
-        -KeyLength 4096 `
-        -CertStoreLocation "Cert:\CurrentUser\My"
-
-    Write-Host "[+] Created StampShell code-signing cert: $($cert.Thumbprint)" -ForegroundColor Green
-    return $cert
-}
-
-function Ensure-StampShellCertTrusted {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate
-    )
-
-    $stores = @(
-        @{ Name = "TrustedPublisher"; Location = "CurrentUser" },
-        @{ Name = "Root";             Location = "CurrentUser" }
-    )
-
-    foreach ($s in $stores) {
-        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($s.Name, $s.Location)
-        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-
-        $existing = $store.Certificates |
-                    Where-Object { $_.Thumbprint -eq $Certificate.Thumbprint }
-
-        if (-not $existing) {
-            $store.Add($Certificate)
-            Write-Host "[+] Added StampShell code-signing cert to $($s.Location)\$($s.Name)." -ForegroundColor Green
-        } else {
-            Write-Host "[=] StampShell cert already in $($s.Location)\$($s.Name)." -ForegroundColor DarkGray
-        }
-
-        $store.Close()
-    }
-}
-
-function Protect-ModuleScripts {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string[]]$ModuleNames
-    )
-
-    $cert = Get-OrCreate-StampShellCodeSigningCert
-    Ensure-StampShellCertTrusted -Certificate $cert
-
-    foreach ($name in $ModuleNames) {
-        try {
-            $mod = Get-Module -ListAvailable -Name $name | Select-Object -First 1
-            if (-not $mod) {
-                Write-Host "[=] Module '$name' not found; skipping signing." -ForegroundColor DarkGray
-                continue
-            }
-
-            $root = $mod.ModuleBase
-            Write-Host "[*] Ensuring scripts for module '$name' are signed in '$root'..." -ForegroundColor Cyan
-
-            $files = Get-ChildItem -Path $root -Recurse -Include *.ps1,*.psm1,*.psd1 -ErrorAction SilentlyContinue
-
-            foreach ($f in $files) {
-                try {
-                    $sig = Get-AuthenticodeSignature -FilePath $f.FullName -ErrorAction SilentlyContinue
-
-                    # Skip if already validly signed
-                    if ($sig -and $sig.Status -eq 'Valid') {
-                        continue
-                    }
-
-                    $sig2 = Set-AuthenticodeSignature -FilePath $f.FullName -Certificate $cert -ErrorAction Stop
-                    if ($sig2.Status -eq 'Valid') {
-                        Write-Host "[+] Signed $($f.FullName) for module '$name'." -ForegroundColor DarkGreen
-                    } else {
-                        Write-Warning "Signature status for $($f.FullName) is '$($sig2.Status)'."
-                    }
-                } catch {
-                    Write-Warning "Failed to sign $($f.FullName): $($_.Exception.Message)"
-                }
-            }
-        } catch {
-            Write-Warning "Failed to process module '$name': $($_.Exception.Message)"
-        }
-    }
-}
-
-# ----------------------------------------
-#  Ensure execution policy is AllSigned for this user
-#  (when box default is Restricted & no GPO is enforcing)
-# ----------------------------------------
-try {
-    $epList = Get-ExecutionPolicy -List  # see all scopes
-
-    $machinePolicy = ($epList | Where-Object { $_.Scope -eq 'MachinePolicy' }).ExecutionPolicy
-    $userPolicy    = ($epList | Where-Object { $_.Scope -eq 'UserPolicy' }).ExecutionPolicy
-    $localMachine  = ($epList | Where-Object { $_.Scope -eq 'LocalMachine' }).ExecutionPolicy
-    $currentUser   = ($epList | Where-Object { $_.Scope -eq 'CurrentUser' }).ExecutionPolicy
-
-    $gpoEnforced = ($machinePolicy -ne 'Undefined' -or $userPolicy -ne 'Undefined')
-
-    if ($gpoEnforced) {
-        Write-Host "[=] Execution policy is controlled by Group Policy; not modifying." -ForegroundColor DarkGray
-    }
-    else {
-        # Typical standalone box: LocalMachine = Restricted, CurrentUser = Undefined
-        if ($localMachine -eq 'Restricted' -and $currentUser -ne 'AllSigned') {
-            Write-Host "[*] Setting CurrentUser execution policy to AllSigned (LocalMachine is Restricted)." -ForegroundColor Yellow
-            Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy AllSigned -Force
-        }
-        else {
-            Write-Host "[=] Execution policy already suitable (LocalMachine=$localMachine, CurrentUser=$currentUser)." -ForegroundColor DarkGray
-        }
-    }
-}
-catch {
-    Write-Warning "Failed to inspect or set execution policy: $($_.Exception.Message)"
-}
-
 function sign {
     param(
         [Parameter(Mandatory)][string]$FilePath
@@ -360,8 +351,6 @@ function Show-ProfileHelp {
     Write-Host "`nTip: Customize this profile at `"$PROFILE`"."
 }
 
-Set-Alias -Name profile-help -Value Show-ProfileHelp -ErrorAction SilentlyContinue
-
 function Prompt {
     # Figure out time of last completed command (or now if none)
     $timeText = ""
@@ -416,6 +405,15 @@ function Prompt {
 
     return " "
 }
+
+# Aliases
+Set-Alias -Name ifconfig -Value ipconfig -ErrorAction SilentlyContinue
+Set-Alias -Name ll       -Value ls       -ErrorAction SilentlyContinue
+Set-Alias -Name reboot   -Value Restart-Computer -ErrorAction SilentlyContinue
+Set-Alias -Name c        -Value Clear-And-Banner -ErrorAction SilentlyContinue
+Set-Alias -Name shell    -Value PowerShell -ErrorAction SilentlyContinue
+Set-Alias -Name profile-help -Value Show-ProfileHelp -ErrorAction SilentlyContinue
+Set-Alias -Name cd..     -Value Set-Location "..\.."
 
 # --- Print banner at startup ---
 Clear-And-Banner -ErrorAction SilentlyContinue
