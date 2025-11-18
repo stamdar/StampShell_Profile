@@ -17,7 +17,7 @@ function Get-OrCreate-StampShellCodeSigningCert {
                 Select-Object -First 1
 
     if ($existing) {
-        Write-Host "\n[=] Using existing StampShell code-signing cert: $($existing.Thumbprint)" -ForegroundColor DarkGray
+        Write-Host "`n[=] Using existing StampShell code-signing cert: $($existing.Thumbprint)" -ForegroundColor DarkGray
         return $existing
     }
 
