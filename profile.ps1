@@ -2,11 +2,19 @@
 #  Custom StampShell Profile
 # ================================
 
+# Ensure modules we import are signed for AllSigned policy
+Protect-ModuleScripts -ModuleNames @(
+    'Terminal-Icons',
+    'posh-git',
+    'PSFzf',
+    'Catppuccin'  # comment out if you don't use it
+)
+
 # Import core modules
-Import-Module PSReadLine -ErrorAction SilentlyContinue
+Import-Module PSReadLine     -ErrorAction SilentlyContinue  # built-in, already signed by MS
 Import-Module Terminal-Icons -ErrorAction SilentlyContinue
-Import-Module posh-git -ErrorAction SilentlyContinue
-Import-Module PSFzf -ErrorAction SilentlyContinue
+Import-Module posh-git       -ErrorAction SilentlyContinue
+Import-Module PSFzf          -ErrorAction SilentlyContinue
 
 # Import Catppuccin (if available) and set Mocha flavor
 try {
@@ -208,6 +216,53 @@ function Ensure-StampShellCertTrusted {
         }
 
         $store.Close()
+    }
+}
+
+function Protect-ModuleScripts {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$ModuleNames
+    )
+
+    $cert = Get-OrCreate-StampShellCodeSigningCert
+    Ensure-StampShellCertTrusted -Certificate $cert
+
+    foreach ($name in $ModuleNames) {
+        try {
+            $mod = Get-Module -ListAvailable -Name $name | Select-Object -First 1
+            if (-not $mod) {
+                Write-Host "[=] Module '$name' not found; skipping signing." -ForegroundColor DarkGray
+                continue
+            }
+
+            $root = $mod.ModuleBase
+            Write-Host "[*] Ensuring scripts for module '$name' are signed in '$root'..." -ForegroundColor Cyan
+
+            $files = Get-ChildItem -Path $root -Recurse -Include *.ps1,*.psm1,*.psd1 -ErrorAction SilentlyContinue
+
+            foreach ($f in $files) {
+                try {
+                    $sig = Get-AuthenticodeSignature -FilePath $f.FullName -ErrorAction SilentlyContinue
+
+                    # Skip if already validly signed
+                    if ($sig -and $sig.Status -eq 'Valid') {
+                        continue
+                    }
+
+                    $sig2 = Set-AuthenticodeSignature -FilePath $f.FullName -Certificate $cert -ErrorAction Stop
+                    if ($sig2.Status -eq 'Valid') {
+                        Write-Host "[+] Signed $($f.FullName) for module '$name'." -ForegroundColor DarkGreen
+                    } else {
+                        Write-Warning "Signature status for $($f.FullName) is '$($sig2.Status)'."
+                    }
+                } catch {
+                    Write-Warning "Failed to sign $($f.FullName): $($_.Exception.Message)"
+                }
+            }
+        } catch {
+            Write-Warning "Failed to process module '$name': $($_.Exception.Message)"
+        }
     }
 }
 
